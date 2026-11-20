@@ -16,11 +16,11 @@ process.on('SIGTERM', () => {
   process.exit(0);
 });
 
-process.on('unhandledRejection', (reason) => {
+process.on('unhandledRejection', (reason: unknown) => {
   console.error('Unhandled rejection:', reason);
 });
 
-process.on('uncaughtException', (error) => {
+process.on('uncaughtException', (error: Error) => {
   console.error('Uncaught exception:', error);
   process.exit(1);
 });

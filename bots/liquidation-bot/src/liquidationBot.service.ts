@@ -3,6 +3,8 @@ import axios from 'axios';
 import { botConfig, BotConfig } from './config';
 import { Logger } from './logger';
 import { ConfirmedLiquidation, LiquidationWebhookService } from './liquidationWebhook.service';
+import { CircuitBreakerRegistry } from './circuitBreaker';
+import { botMetrics } from './metrics';
 
 interface PositionHealth {
   address: string;
@@ -36,9 +38,34 @@ export class LiquidationBotService {
   private ws: WebSocket | null = null;
   private readonly webhook: LiquidationWebhookService;
 
-  constructor(config: BotConfig = botConfig, logger: Logger = new Logger(config.logLevel)) {
+  /**
+   * Per-address in-flight guard.
+   *
+   * Before we increment activeLiquidations we insert the position address
+   * here. Any concurrent call from the WebSocket handler or the poll loop
+   * that finds the address already present bails out immediately without
+   * spawning a second attempt against the same position.
+   */
+  private readonly inFlight = new Set<string>();
+
+  /**
+   * Per-address circuit breaker.
+   *
+   * After `failureThreshold` consecutive failures for the same address the
+   * breaker opens and all further attempts are suppressed for `openWindowMs`.
+   * This prevents a stuck position from monopolising concurrency slots and
+   * burning RPC quota on every poll cycle.
+   */
+  private readonly breaker: CircuitBreakerRegistry;
+
+  constructor(
+    config: BotConfig = botConfig,
+    logger: Logger = new Logger(config.logLevel),
+    breaker: CircuitBreakerRegistry = new CircuitBreakerRegistry(),
+  ) {
     this.config = config;
     this.logger = logger;
+    this.breaker = breaker;
     this.webhook = new LiquidationWebhookService(
       {
         url: config.liquidationWebhookUrl,
@@ -97,7 +124,7 @@ export class LiquidationBotService {
         }
       });
 
-      this.ws.on('error', (err) => {
+      this.ws.on('error', (err: Error) => {
         this.logger.error('WebSocket error', { error: err.message });
       });
     } catch (err) {
@@ -132,7 +159,7 @@ export class LiquidationBotService {
 
   private evaluatePositions(positions: PositionHealth[]): void {
     const liquidatable = positions.filter((p) => {
-      const profitXlm = p.netProfit / 10000000;
+      const profitXlm = p.netProfit / 10_000_000;
       return p.healthFactor < 1.2 && profitXlm >= this.config.minProfitThresholdXlm;
     });
 
@@ -140,10 +167,35 @@ export class LiquidationBotService {
 
     const selected = this.selectTargets(liquidatable);
     for (const target of selected) {
-      if (this.activeLiquidations < this.config.maxConcurrentLiquidations) {
-        this.executeLiquidation(target);
+      // Global concurrency cap
+      if (this.activeLiquidations >= this.config.maxConcurrentLiquidations) break;
+
+      // Per-address in-flight deduplication — the most common source of
+      // redundant RPC calls when both WS and poll fire within the same window.
+      if (this.inFlight.has(target.address)) {
+        botMetrics.liquidation_skipped_inflight_total++;
+        this.logger.debug('Skipping liquidation — already in-flight', {
+          position: target.address,
+        });
+        continue;
       }
+
+      // Per-address circuit breaker — suppresses positions that have failed
+      // repeatedly, freeing slots for positions that can succeed.
+      if (!this.breaker.isAllowed(target.address)) {
+        botMetrics.liquidation_skipped_circuitbreaker_total++;
+        this.logger.debug('Skipping liquidation — circuit breaker open', {
+          position: target.address,
+          breakerState: this.breaker.getState(target.address),
+        });
+        continue;
+      }
+
+      void this.executeLiquidation(target);
     }
+
+    // Keep the gauge in sync after each evaluation pass
+    botMetrics.circuit_breaker_open_count = this.breaker.openCount();
   }
 
   private selectTargets(positions: PositionHealth[]): PositionHealth[] {
@@ -155,8 +207,6 @@ export class LiquidationBotService {
         sorted.sort((a, b) => b.netProfit - a.netProfit);
         break;
       case 'highest_risk':
-        sorted.sort((a, b) => a.healthFactor - b.healthFactor);
-        break;
       case 'lowest_hf':
         sorted.sort((a, b) => a.healthFactor - b.healthFactor);
         break;
@@ -166,8 +216,15 @@ export class LiquidationBotService {
   }
 
   private async executeLiquidation(position: PositionHealth): Promise<void> {
+    // Register in-flight before touching any counters so concurrent callers
+    // see the guard as soon as we start.
+    this.inFlight.add(position.address);
     this.activeLiquidations++;
-    const profitXlm = position.netProfit / 10000000;
+    botMetrics.active_liquidations = this.activeLiquidations;
+    botMetrics.liquidation_attempts_total++;
+
+    const startedAt = Date.now();
+    const profitXlm = position.netProfit / 10_000_000;
 
     this.logger.info('Attempting liquidation', {
       position: position.address,
@@ -176,7 +233,7 @@ export class LiquidationBotService {
     });
 
     if (this.config.dryRun) {
-      this.logger.info('DRY RUN - Would liquidate', {
+      this.logger.info('DRY RUN — would liquidate', {
         position: position.address,
         estimatedProfitStroops: position.estimatedProfit,
         gasCostStroops: position.gasCostStroops,
@@ -189,7 +246,9 @@ export class LiquidationBotService {
         timestamp: Date.now(),
       };
       this.results.push(result);
-      this.activeLiquidations--;
+      botMetrics.liquidation_successes_total++;
+      this.breaker.recordSuccess(position.address);
+      this.finaliseLiquidation(position.address, startedAt);
       return;
     }
 
@@ -200,7 +259,7 @@ export class LiquidationBotService {
           positionAddress: position.address,
           maxRepayAmount: Math.floor(position.debtValue * 0.5).toString(),
         },
-        { timeout: 30000 }
+        { timeout: 30000 },
       );
 
       const result: LiquidationResult = {
@@ -212,10 +271,15 @@ export class LiquidationBotService {
       };
 
       this.results.push(result);
+      botMetrics.liquidation_successes_total++;
+      this.breaker.recordSuccess(position.address);
+
       await this.notifyWebhook(result);
+
       this.logger.info('Liquidation successful', {
         position: position.address,
         txHash: result.txHash,
+        latencyMs: Date.now() - startedAt,
       });
     } catch (err: any) {
       const result: LiquidationResult = {
@@ -225,13 +289,25 @@ export class LiquidationBotService {
         timestamp: Date.now(),
       };
       this.results.push(result);
+      botMetrics.liquidation_failures_total++;
+      this.breaker.recordFailure(position.address);
+
       this.logger.error('Liquidation failed', {
         position: position.address,
         error: err.message,
+        breakerState: this.breaker.getState(position.address),
       });
     } finally {
-      this.activeLiquidations--;
+      this.finaliseLiquidation(position.address, startedAt);
     }
+  }
+
+  private finaliseLiquidation(address: string, startedAt: number): void {
+    this.inFlight.delete(address);
+    this.activeLiquidations--;
+    botMetrics.active_liquidations = this.activeLiquidations;
+    botMetrics.circuit_breaker_open_count = this.breaker.openCount();
+    botMetrics.recordLiquidationLatency(Date.now() - startedAt);
   }
 
   private async notifyWebhook(result: LiquidationResult): Promise<void> {
@@ -242,7 +318,12 @@ export class LiquidationBotService {
       profitStroops: result.profitStroops,
       timestamp: result.timestamp,
     };
-    await this.webhook.deliver(liquidation);
+    const delivered = await this.webhook.deliver(liquidation);
+    if (delivered) {
+      botMetrics.webhook_deliveries_total++;
+    } else {
+      botMetrics.webhook_failures_total++;
+    }
   }
 
   public getStats(): { totalAttempted: number; totalSuccessful: number; totalProfit: number } {
@@ -256,5 +337,10 @@ export class LiquidationBotService {
 
   public getResults(): LiquidationResult[] {
     return [...this.results];
+  }
+
+  /** Expose the circuit breaker registry for operator inspection / testing. */
+  public getBreakerRegistry(): CircuitBreakerRegistry {
+    return this.breaker;
   }
 }

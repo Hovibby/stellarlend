@@ -20,6 +20,11 @@ export interface BotConfig {
   webhookMaxAttempts: number;
   webhookRetryDelayMs: number;
   logLevel: string;
+  /**
+   * Minimum discount (in basis points) required before the auction bidder
+   * considers placing a bid.  Default: 500 bps (5%).
+   */
+  minDiscountBps: number;
 }
 
 export function loadConfig(): BotConfig {
@@ -42,6 +47,7 @@ export function loadConfig(): BotConfig {
     webhookMaxAttempts: parseInt(process.env.WEBHOOK_MAX_ATTEMPTS || '3', 10),
     webhookRetryDelayMs: parseInt(process.env.WEBHOOK_RETRY_DELAY_MS || '500', 10),
     logLevel: process.env.LOG_LEVEL || 'info',
+    minDiscountBps: parseInt(process.env.MIN_DISCOUNT_BPS || '500', 10),
   };
 }
 

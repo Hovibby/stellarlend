@@ -70,7 +70,7 @@ export class LiquidationWebhookService {
         this.logger.info('Liquidation webhook delivered', { id: payload.id, attempt });
         return true;
       } catch (error: unknown) {
-        const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+        const status = axios.isAxiosError(error) ? (error as { response?: { status?: number } }).response?.status : undefined;
         const retryable = status === undefined || status === 429 || status >= 500;
         if (!retryable || attempt === maxAttempts) {
           this.logger.error('Liquidation webhook delivery failed', { id: payload.id, attempt, status });
